@@ -35,7 +35,7 @@ class Transaction(Base):
     merchant: Mapped[str] = mapped_column(String(120), index=True)
     amount: Mapped[float] = mapped_column(Float)  # negative = money out, positive = money in
     category: Mapped[str] = mapped_column(String(60), index=True)
-    category_source: Mapped[str] = mapped_column(String(20), default="rule")  # rule | learned | llm | user | default
+    category_source: Mapped[str] = mapped_column(String(20), default="rule")  # rule | learned | llm | similar | user | default
 
     statement: Mapped[Statement] = relationship(back_populates="transactions")
 

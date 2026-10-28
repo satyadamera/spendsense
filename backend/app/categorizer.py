@@ -3,7 +3,9 @@
 Order of precedence for each transaction:
 1. a category the user (or the LLM) previously assigned to this merchant (learned),
 2. keyword rules below,
-3. an optional LLM call for merchants nothing else recognised,
+3. for merchants nothing else recognised, retrieval-augmented categorisation: similar merchants
+   the user already labelled are fetched from a vector store (``retriever.py``) and passed to
+   an optional LLM call as examples; with no LLM, a very close user-labelled match is used,
 4. "Other".
 
 Only merchant names are ever sent to the LLM: no amounts, dates or raw narrations.
@@ -92,19 +94,57 @@ def llm_enabled() -> bool:
     return bool(os.getenv("ANTHROPIC_API_KEY"))
 
 
-def llm_categorise(merchants: list[str], timeout: float = 30.0) -> dict[str, str]:
-    """Ask Claude to categorise merchant names. Returns {} if disabled or on any failure."""
-    merchants = sorted({m for m in merchants if m})
-    if not merchants or not llm_enabled():
-        return {}
-    prompt = (
+def nearest_user_label(neighbours: list, threshold: float | None = None) -> str | None:
+    """Category of the closest *user-confirmed* neighbour, if it is similar enough to trust.
+
+    Used when no LLM is configured: a k-NN classifier over the user's own corrections.
+    """
+    if threshold is None:
+        threshold = float(os.getenv("SPENDSENSE_KNN_THRESHOLD", "0.8"))
+    for n in neighbours:
+        if n.source == "user" and n.similarity >= threshold:
+            return n.category
+    return None
+
+
+def build_prompt(merchants: list[str], context: dict[str, list] | None = None) -> str:
+    """LLM prompt; retrieved neighbours are added as few-shot examples per merchant."""
+    context = context or {}
+    lines = []
+    for m in merchants:
+        lines.append(f"- {m}")
+        for n in context.get(m, []):
+            tag = "user-confirmed" if n.source == "user" else "earlier guess"
+            lines.append(f"    similar: \"{n.merchant}\" -> {n.category} "
+                         f"({tag}, similarity {n.similarity:.2f})")
+    grounding = ""
+    if any(context.get(m) for m in merchants):
+        grounding = (
+            "Some merchants list similar merchants this user has already categorised. Use them as "
+            "evidence of how this user labels things, and prefer user-confirmed examples, but only "
+            "follow an example if it really is the same kind of business.\n"
+        )
+    return (
         "Categorise each merchant name from an Indian bank/UPI statement into exactly one of "
         f"these categories: {', '.join(CATEGORIES)}.\n"
         "If a name looks like a private person (a UPI transfer to an individual), use \"Transfers\". "
         "If unsure, use \"Other\".\n"
-        "Reply with only a JSON object mapping each merchant name exactly as given to its category.\n\n"
-        "Merchants:\n" + "\n".join(f"- {m}" for m in merchants)
+        + grounding
+        + "Reply with only a JSON object mapping each merchant name exactly as given to its category.\n\n"
+        "Merchants:\n" + "\n".join(lines)
     )
+
+
+def llm_categorise(merchants: list[str], context: dict[str, list] | None = None,
+                   timeout: float = 30.0) -> dict[str, str]:
+    """Ask Claude to categorise merchant names, grounded in retrieved examples when given.
+
+    Returns {} if disabled or on any failure.
+    """
+    merchants = sorted({m for m in merchants if m})
+    if not merchants or not llm_enabled():
+        return {}
+    prompt = build_prompt(merchants, context)
     try:
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
