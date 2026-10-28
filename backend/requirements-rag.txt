@@ -1,0 +1,5 @@
+# Optional: retrieval-augmented categorisation (embeddings + vector store).
+# Install on top of requirements.txt:  pip install -r requirements-rag.txt
+# Without these, SpendSense runs exactly as before and skips the retrieval step.
+chromadb>=1.0
+sentence-transformers>=3.0

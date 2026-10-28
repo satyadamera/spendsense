@@ -1,6 +1,7 @@
 """SpendSense REST API."""
 from __future__ import annotations
 
+import logging
 import os
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -12,17 +13,44 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import analytics, categorizer, reports
-from .database import Base, engine, get_db
+from . import analytics, categorizer, reports, retriever
+from .database import Base, SessionLocal, engine, get_db
 from .models import MerchantCategory, Statement, Transaction
 from .parser import StatementFormatError, parse_statement
 from .schemas import CategoryUpdate, StatementOut, TransactionOut, UploadResult
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+log = logging.getLogger(__name__)
+
+
+def _index_labels(items: list[tuple[str, str, str]]) -> None:
+    """Push (merchant, category, source) labels into the vector store; never fails a request."""
+    store = retriever.get_retriever()
+    if store is None or not items:
+        return
+    try:
+        store.upsert(items)
+    except Exception as exc:
+        log.warning("Could not update vector store: %s", exc)
+
+
+def _sync_vector_store() -> None:
+    store = retriever.get_retriever()
+    if store is None:
+        return
+    with SessionLocal() as db:
+        labels = [(m.merchant, m.category, m.source) for m in db.scalars(select(MerchantCategory))]
+    try:
+        added = store.sync(labels)
+        log.info("Vector store ready: %d labelled merchants (%d re-embedded)", store.count(), added)
+    except Exception as exc:
+        log.warning("Vector store sync failed: %s", exc)
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    _sync_vector_store()
     yield
 
 
@@ -65,7 +93,10 @@ def _summary(db: Session, statement_id: int | None) -> dict:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "llm_categorisation": categorizer.llm_enabled()}
+    store = retriever.get_retriever()
+    return {"status": "ok", "llm_categorisation": categorizer.llm_enabled(),
+            "retrieval": store is not None,
+            "indexed_merchants": store.count() if store is not None else 0}
 
 
 @app.get("/api/categories")
@@ -96,15 +127,29 @@ async def upload_statement(file: UploadFile = File(...), db: Session = Depends(g
             categories.append(None); sources.append(None)
 
     unknown = [m for m, c in zip(df["merchant"], categories) if c is None]
-    llm_map = categorizer.llm_categorise(unknown)
+
+    # Retrieval: nearest already-labelled merchants for each unknown one.
+    neighbours: dict[str, list] = {}
+    store = retriever.get_retriever()
+    if store is not None and unknown:
+        try:
+            neighbours = store.similar(unknown)
+        except Exception as exc:
+            log.warning("Retrieval skipped: %s", exc)
+
+    # Generation: the LLM decides, with the retrieved examples in its prompt.
+    llm_map = categorizer.llm_categorise(unknown, context=neighbours)
     for i, merchant in enumerate(df["merchant"]):
         if categories[i] is None:
             if merchant in llm_map:
                 categories[i], sources[i] = llm_map[merchant], "llm"
+            elif (cat := categorizer.nearest_user_label(neighbours.get(merchant, []))) is not None:
+                categories[i], sources[i] = cat, "similar"
             else:
                 categories[i], sources[i] = "Other", "default"
     for merchant, cat in llm_map.items():
         db.merge(MerchantCategory(merchant=categorizer.normalise_merchant(merchant), category=cat, source="llm"))
+    _index_labels([(m, c, "llm") for m, c in llm_map.items()])
 
     statement = Statement(
         filename=file.filename or "statement",
@@ -162,6 +207,8 @@ def update_category(tx_id: int, body: CategoryUpdate, db: Session = Depends(get_
             other.category, other.category_source = body.category, "learned"
     db.commit()
     db.refresh(tx)
+    if body.apply_to_merchant:
+        _index_labels([(tx.merchant, body.category, "user")])
     return tx
 
 
